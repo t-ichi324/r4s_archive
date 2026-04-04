@@ -299,23 +299,23 @@ class R4SArchive:
     WRITE_BUFFER_SIZE = 10 * 1024 * 1024
     MAX_MEMORY_BYTES = 5 * 1024 * 1024
 
-    @staticmethod
-    def create(path: Union[str, Path], password: Optional[str] = None, 
+    @classmethod
+    def create(cls, path: Union[str, Path], password: Optional[str] = None, 
                key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096) -> 'R4SArchive':
         """新規にアーカイブを作成し、インスタンスを返す（既存ファイルがあれば FileExistsError）"""
         path = Path(path)
         if path.exists():
             raise FileExistsError(f"Archive already exists at {path}")
         
-        inst = R4SArchive(path, password, key_len, scramble_size)
+        inst = cls(path, password, key_len, scramble_size)
         inst._is_ready = True
         inst.save()
         return inst
 
-    @staticmethod
-    def open(path: Union[str, Path], password: Optional[str] = None) -> 'R4SArchive':
+    @classmethod
+    def open(cls, path: Union[str, Path], password: Optional[str] = None) -> 'R4SArchive':
         """既存のアーカイブを開き、ロードして返す（ファイルがない場合は FileNotFoundError）"""
-        inst = R4SArchive(path, password)
+        inst = cls(path, password)
         if not inst.path.exists():
             raise FileNotFoundError(f"Archive not found at {inst.path}")
         if inst.path.stat().st_size < R4SLayout.HEADER_SIZE:
@@ -613,7 +613,7 @@ class R4SArchive:
         target_scr_size = new_scramble_size if new_scramble_size is not None else self._layout.scramble_size
         
         # 新しい設定で空のアーカイブ・インスタンスを準備（自動保存なし）
-        new_archive = R4SArchive(tmp_path, self._password, 
+        new_archive = type(self)(tmp_path, self._password, 
                                  key_len=target_key_len, 
                                  scramble_size=target_scr_size)
                                         
