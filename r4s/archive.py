@@ -294,6 +294,16 @@ class R4SEntry:
         self.pending_source_archive: Optional['R4SArchive'] = None
         self.pending_source_uid: Optional[int] = None
         self.pending_is_asset: bool = False
+        
+    @property
+    def is_new(self) -> bool:
+        """新規作成（オフセット未確定）かつ削除されていないエントリ"""
+        return self.offset == 0 and not self.is_deleted
+
+    @property
+    def is_modified(self) -> bool:
+        """データが変更されているか（メモリ上のフラグ）"""
+        return self._is_modified
 
 class R4SArchive:
     WRITE_BUFFER_SIZE = 10 * 1024 * 1024
