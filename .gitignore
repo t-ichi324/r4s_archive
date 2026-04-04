@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary/Cache files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project Specific
+*.opt_tmp
+*.r4s
+test_archive.r4s
+test_r4s.py
+
+# Environment
+.env
+venv/
+ENV/
+
+# Agent/AI (Optional, keeping as per plan)
+.agent/
+test/
