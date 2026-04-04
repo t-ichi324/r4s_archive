@@ -43,6 +43,30 @@ Retrieves data from the archive.
 - **Arguments**: `identifier`: Logical path (string) or `UID` (integer).
 - **Returns**: Content (`bytes`). Returns `None` if not found.
 
+### `list_entries(parent_path=None, recursive=True)`
+Returns a list of all entries (files) in the archive.
+- **Arguments**:
+    - `parent_path`: Optional parent directory path to filter entries.
+    - `recursive`: If `True`, includes entries in subdirectories. If `False`, only lists direct children.
+- **Returns**: List of tuples `(UID, logical_path)`.
+
+---
+
+## 💎 Asset Operations
+
+### `set_asset(key, source, mime="application/octet-stream")`
+Registers an asset (thumbnail, metadata, etc.) in the archive.
+- **Arguments**: Same as `set_entry`, but for assets.
+- **Returns**: Assigned `UID`.
+
+### `list_assets(parent_path=None, recursive=True)`
+Returns a list of all assets in the archive.
+- **Arguments**: Same as `list_entries`.
+- **Returns**: List of tuples `(UID, key)`.
+
+### `remove_asset(identifier)`
+Marks an asset as deleted.
+
 ---
 
 ## ⚡ Security & Optimization

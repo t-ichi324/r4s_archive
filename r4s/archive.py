@@ -731,8 +731,30 @@ class R4SArchive:
                 yield data
                 remaining -= len(data)
 
-    def list_entries(self) -> List[Tuple[int, str]]:
-        return [(e.uid, e.name) for e in self._entries.values() if not e.is_deleted]
+    def list_entries(self, parent_path: Optional[str] = None, recursive: bool = True) -> List[Tuple[int, str]]:
+        """
+        アーカイブ内のエントリ一覧を返します。
+        :param parent_path: フィルタリングする親ディレクトリパス。
+        :param recursive: Trueの場合、サブディレクトリ内も含みます。
+        """
+        items = [(e.uid, e.name) for e in self._entries.values() if not e.is_deleted]
+        if parent_path is None:
+            return items
+            
+        target_parent = parent_path.replace("\\", "/").rstrip("/")
+        if target_parent == ".": target_parent = ""
+
+        results = []
+        for uid, name in items:
+            norm_name = name.replace("\\", "/")
+            if target_parent == "":
+                if recursive or "/" not in norm_name:
+                    results.append((uid, name))
+            elif norm_name.startswith(target_parent + "/"):
+                rel_path = norm_name[len(target_parent)+1:]
+                if recursive or "/" not in rel_path:
+                    results.append((uid, name))
+        return results
 
     # --- Asset API ---
     def set_asset(self, key: str, source: Union[bytes, str, Path], mime: str = "application/octet-stream") -> int:
@@ -758,8 +780,30 @@ class R4SArchive:
         if self._resolve_uid(identifier, is_asset=True) is None: return None
         return b"".join(list(self.iter_entry(identifier, is_asset=True)))
 
-    def list_assets(self) -> List[Tuple[int, str]]:
-        return [(a.uid, a.name) for a in self._assets.values() if not a.is_deleted]
+    def list_assets(self, parent_path: Optional[str] = None, recursive: bool = True) -> List[Tuple[int, str]]:
+        """
+        アーカイブ内のアセット一覧を返します。
+        :param parent_path: フィルタリングする親ディレクトリパス。
+        :param recursive: Trueの場合、サブディレクトリ内も含みます。
+        """
+        items = [(a.uid, a.name) for a in self._assets.values() if not a.is_deleted]
+        if parent_path is None:
+            return items
+            
+        target_parent = parent_path.replace("\\", "/").rstrip("/")
+        if target_parent == ".": target_parent = ""
+
+        results = []
+        for uid, name in items:
+            norm_name = name.replace("\\", "/")
+            if target_parent == "":
+                if recursive or "/" not in norm_name:
+                    results.append((uid, name))
+            elif norm_name.startswith(target_parent + "/"):
+                rel_path = norm_name[len(target_parent)+1:]
+                if recursive or "/" not in rel_path:
+                    results.append((uid, name))
+        return results
 
     # --- Metadata API ---
     def get_entry_meta(self, identifier: Union[str, int], key: Optional[str] = None, default: Any = None) -> Any:
