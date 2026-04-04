@@ -311,21 +311,23 @@ class R4SArchive:
 
     @classmethod
     def create(cls, path: Union[str, Path], password: Optional[str] = None, 
-               key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096) -> 'R4SArchive':
+               key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096,
+               keep_open: bool = False) -> 'R4SArchive':
         """新規にアーカイブを作成し、インスタンスを返す（既存ファイルがあれば FileExistsError）"""
         path = Path(path)
         if path.exists():
             raise FileExistsError(f"Archive already exists at {path}")
         
-        inst = cls(path, password, key_len, scramble_size)
+        inst = cls(path, password, key_len, scramble_size, keep_open=keep_open)
         inst._is_ready = True
         inst.save()
         return inst
 
     @classmethod
-    def open(cls, path: Union[str, Path], password: Optional[str] = None) -> 'R4SArchive':
+    def open(cls, path: Union[str, Path], password: Optional[str] = None,
+             keep_open: bool = False) -> 'R4SArchive':
         """既存のアーカイブを開き、ロードして返す（ファイルがない場合は FileNotFoundError）"""
-        inst = cls(path, password)
+        inst = cls(path, password, keep_open=keep_open)
         if not inst.path.exists():
             raise FileNotFoundError(f"Archive not found at {inst.path}")
         if inst.path.stat().st_size < R4SLayout.HEADER_SIZE:
@@ -337,7 +339,8 @@ class R4SArchive:
         return inst
 
     def __init__(self, path: Union[str, Path], password: Optional[str] = None, 
-               key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096):
+               key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096,
+               keep_open: bool = False):
         # 鍵長のバリデーション (fail-fast)
         if not R4SKeyLen.is_valid(key_len):
             raise ValueError(f"Unsupported key length: {key_len}. Use R4SKeyLen.")
@@ -346,6 +349,8 @@ class R4SArchive:
         self._password = password
         self._is_ready = False
         self._is_dirty = False
+        self._keep_open = keep_open
+        self._f_handle = None
 
         if self.path.exists():
             # Note: Layout is loaded here, but full manifest logic is in _load()
@@ -383,6 +388,13 @@ class R4SArchive:
     # --- Lifecycle ---
     def close(self) -> bool:
         self._is_ready = False
+        if self._f_handle:
+            try:
+                self._f_handle.close()
+            except Exception:
+                pass
+            self._f_handle = None
+            
         if self._staging_file_path.exists():
             try:
                 os.remove(self._staging_file_path)
@@ -411,6 +423,15 @@ class R4SArchive:
         uids = index.get(identifier, [])
         valid = [u for u in uids if u in collection and not collection[u].is_deleted]
         return max(valid) if valid else None
+
+    def _get_read_handle(self):
+        """物理ファイルへの読み込みハンドルを取得します（keep_open に対応）"""
+        if not self._keep_open:
+            return open(self.path, "rb")
+            
+        if self._f_handle is None or self._f_handle.closed:
+            self._f_handle = open(self.path, "rb")
+        return self._f_handle
 
     def _load(self, password):
         self._entries.clear()
@@ -497,6 +518,14 @@ class R4SArchive:
     def save(self):
         if not self._is_dirty: return
             
+        # 書き込み前に読み取りハンドルがあれば閉じる（Windowsでの衝突回避）
+        if self._f_handle:
+            try:
+                self._f_handle.close()
+            except Exception:
+                pass
+            self._f_handle = None
+
         bm = R4SBinaryManager(self.path)
         write_buffer = bytearray()
         def flush_buf(f_h):
@@ -615,6 +644,9 @@ class R4SArchive:
                 logger.error(f"Save failed, rolled back: {e}"); raise
                 
         self._is_dirty = False
+        # 書き込み終了後、必要ならハンドルを再開
+        if self._keep_open:
+            self._get_read_handle()
 
     def optimize(self, new_key_len: Optional[int] = None, new_scramble_size: Optional[int] = None):
         tmp_path = self.path.with_suffix(".opt_tmp")
@@ -727,7 +759,9 @@ class R4SArchive:
             return
 
         if not self.path.exists(): return
-        with open(self.path, "rb") as f:
+        
+        f = self._get_read_handle()
+        try:
             f.seek(entry.offset)
             remaining = entry.size
             scrambled_len = min(remaining, self._layout.scramble_size)
@@ -740,6 +774,9 @@ class R4SArchive:
                 data = f.read(min(chunk_size, remaining))
                 yield data
                 remaining -= len(data)
+        finally:
+            if not self._keep_open:
+                f.close()
 
     def list_entries(self, parent_path: Optional[str] = None, recursive: bool = True) -> List[Tuple[int, str]]:
         """
