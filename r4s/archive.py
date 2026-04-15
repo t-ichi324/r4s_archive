@@ -719,6 +719,49 @@ class R4SArchive:
         self._path_index.setdefault(new_name, []).append(uid)
         self._is_dirty = True
 
+    def rename_directory(self, old_dir: str, new_dir: str):
+        """
+        ディレクトリパス（プレフィックス）を一括で置換します。
+        エントリーとアセットの両方が対象となります。
+        """
+        target_old = old_dir.replace("\\", "/").strip("/")
+        target_new = new_dir.replace("\\", "/").strip("/")
+        if not target_old: return
+
+        # 1. エントリーのリネーム
+        e_items = self.list_entries(target_old, recursive=True)
+        for uid, name in e_items:
+            norm_name = name.replace("\\", "/")
+            if norm_name.startswith(target_old + "/"):
+                new_name = target_new + "/" + norm_name[len(target_old)+1:]
+                self.rename_entry(uid, new_name)
+            elif norm_name == target_old:
+                self.rename_entry(uid, target_new)
+
+        # 2. アセットのリネーム
+        a_items = self.list_assets(target_old, recursive=True)
+        for uid, name in a_items:
+            norm_name = name.replace("\\", "/")
+            if norm_name.startswith(target_old + "/"):
+                new_name = target_new + "/" + norm_name[len(target_old)+1:]
+                self.rename_asset(uid, new_name)
+            elif norm_name == target_old:
+                self.rename_asset(uid, target_new)
+
+    def remove_directory(self, target_dir: str):
+        """
+        指定したディレクトリパス（プレフィックス）を持つすべての
+        エントリーとアセットを一括で削除（削除マーク）します。
+        """
+        target = target_dir.replace("\\", "/").strip("/")
+        if not target: return
+
+        for uid, _ in self.list_entries(target, recursive=True):
+            self.remove_entry(uid)
+
+        for uid, _ in self.list_assets(target, recursive=True):
+            self.remove_asset(uid)
+
     def get_entry(self, identifier: Union[str, int]) -> Optional[bytes]:
         if self._resolve_uid(identifier) is None: return None
         return b"".join(list(self.iter_entry(identifier)))
@@ -819,9 +862,20 @@ class R4SArchive:
 
     def remove_asset(self, identifier: Union[str, int]):
         uid = self._resolve_uid(identifier, is_asset=True)
+        if uid is None and identifier in self._assets: uid = identifier # UID直指定の救済
         if uid is not None and not self._assets[uid].is_deleted:
             self._assets[uid].is_deleted = True
             self._is_dirty = True
+
+    def rename_asset(self, identifier: Union[str, int], new_name: str):
+        uid = self._resolve_uid(identifier, is_asset=True)
+        if uid is None: return
+        asset = self._assets[uid]
+        old_name = asset.name
+        if old_name in self._asset_key_index: self._asset_key_index[old_name].remove(uid)
+        asset.name = new_name
+        self._asset_key_index.setdefault(new_name, []).append(uid)
+        self._is_dirty = True
 
     def get_asset(self, identifier: Union[str, int]) -> Optional[bytes]:
         if self._resolve_uid(identifier, is_asset=True) is None: return None
@@ -957,11 +1011,34 @@ class R4SArchive:
         return self.extract_assets(valid_uids, output_dir)
 
     # --- Navigation & Status ---
-    def get_tree(self, include_deleted: bool = False) -> dict:
-        root = {"type": "directory", "name": "/", "children": {}}
-        for uid, entry in self._entries.items():
+    def get_tree(self, parent_path: Optional[str] = None, include_deleted: bool = False) -> dict:
+        root_label = "/"
+        target_entries = self._entries.items()
+        
+        prefix = ""
+        if parent_path:
+            prefix = parent_path.replace("\\", "/").strip("/")
+            root_label = prefix.split("/")[-1]
+            # list_entries を使って対象UIDを抽出
+            uids = [u for u, n in self.list_entries(prefix, recursive=True)]
+            target_entries = [(u, self._entries[u]) for u in uids]
+        
+        root = {"type": "directory", "name": root_label, "children": {}}
+        for uid, entry in target_entries:
             if not include_deleted and entry.is_deleted: continue
-            parts = entry.name.strip("/").split("/")
+            
+            fullname = entry.name.replace("\\", "/").strip("/")
+            if prefix:
+                if fullname.startswith(prefix + "/"):
+                    rel_name = fullname[len(prefix)+1:]
+                elif fullname == prefix:
+                    continue # 親ディレクトリ自身は含めない（children構造のため）
+                else:
+                    continue
+                parts = rel_name.split("/")
+            else:
+                parts = fullname.split("/")
+                
             curr = root
             for i, p in enumerate(parts):
                 if i == len(parts) - 1:

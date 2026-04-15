@@ -38,6 +38,18 @@
 - **戻り値**: 割り当てられた `UID`（整数）。
 - **注意**: この時点ではメモリ/ステージングに保持され、`save()` で物理ファイルに書き込まれます。
 
+### `rename_entry(identifier, new_name)`
+単一のエントリーの名前を変更します。
+
+### `rename_directory(old_dir, new_dir)`
+指定したディレクトリプレフィックスを持つすべてのエントリーとアセットを一括でリネーム（移動）します。
+- **引数**:
+    - `old_dir`: 変更前のディレクトリパス。
+    - `new_dir`: 変更後のディレクトリパス。
+
+### `remove_directory(target_dir)`
+指定したディレクトリ（プレフィックス）以下のすべてのエントリーとアセットを一括で削除マークします。
+
 ### `get_entry(identifier)`
 アーカイブ内のデータを取得します。
 - **引数**: `identifier`: 論理パス（文字列）または `UID`（整数）。
@@ -60,11 +72,12 @@
 
 ### `set_asset(key, source, mime="application/octet-stream")`
 アーカイブ内にアセット（サムネイルやメタデータ等）を登録します。
-- **引数**:
-    - `key`: アセットの識別キー（論理パス形式も可）。
-    - `source`: データ内容 (`bytes`) またはソースファイルパス (`str`/`Path`)。
-    - `mime`: MIMEタイプ。
-- **戻り値**: 割り当てられた `UID`。
+
+### `get_asset(identifier)`
+アセットのデータを取得します。
+
+### `rename_asset(identifier, new_key)`
+単一のアセットをリネーム（キーの変更）します。
 
 ### `list_assets(parent_path=None, recursive=True)`
 アーカイブ内のアセット一覧を取得します。
@@ -91,7 +104,17 @@
 
 ---
 
-## 💾 保存と終了
+## 🔍 ユーティリティ
+
+### `get_tree(parent_path=None, include_deleted=False)`
+アーカイブ内の構造をツリー形式（辞書）で取得します。
+- **引数**:
+    - `parent_path`: 指定した場合、そのディレクトリをルートとする部分木を返します。
+    - `include_deleted`: 削除済みエントリーを含めるかどうか。
+- **戻り値**: `{"type": "directory/file", "name": "...", "children": {...}}` 形式の辞書。
+
+### `get_stats()`
+アーカイブの統計情報（ファイル数、サイズ、リビジョン等）を取得します。
 
 ### `save()`
 すべての変更（新ファイル、削除、セキュリティ更新）を物理ファイルに確定させます。

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [1.0.1] - 2026-04-15
+
+### Added (追加)
+- **Directory Renaming**: Implemented `R4SArchive.rename_directory(old_dir, new_dir)` to batch rename entries and assets.
+  - 指定したフォルダ（プレフィックス）以下の全エントリーとアセットを一括リネームする `R4SArchive.rename_directory` を実装。
+- **Directory Removal**: Implemented `R4SArchive.remove_directory(target_dir)` to batch remove entries and assets.
+  - 指定したフォルダ以下の全データを一括で削除マークする `R4SArchive.remove_directory` を実装。
+- **Asset Renaming**: Implemented `R4SArchive.rename_asset(key, new_key)` for individual asset renaming.
+  - アセット個別のリネームに対応する `R4SArchive.rename_asset` を実装。
+- **Tree Filtering**: Added filtering support to `R4SArchive.get_tree(parent_path=...)`.
+  - 指定したディレクトリを起点とするサブツリー生成機能を追加。
+
 ## [1.0.0] - 2026-04-04
 
 ### Added (追加)
