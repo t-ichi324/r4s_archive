@@ -1,3 +1,12 @@
+"""R4S Archive - lightweight single-file archive with obfuscation.
+
+NOTE ON SECURITY: R4S applies a repeating-key XOR to the first
+``scramble_size`` bytes of each payload and to the manifest. This is an
+*obfuscation* layer to deter casual inspection, NOT cryptographic
+protection: a known-plaintext prefix (e.g. a PNG/JPEG signature) allows
+trivial key recovery, and data beyond ``scramble_size`` is stored as-is.
+Use real encryption (e.g. AES-GCM) if confidentiality matters.
+"""
 import os
 import struct
 import secrets
@@ -7,31 +16,31 @@ import json
 import contextlib
 import time
 import binascii
-import sys
 from enum import IntEnum
 from pathlib import Path
 from typing import List, Dict, Optional, Union, Iterator, Tuple, Any
 
-import uuid
-
 class R4SKeyLen(IntEnum):
-    """Supported Key Lengths for R4S Archive"""
-    LOW    = 8   # 64-bit (Standard)
-    MID    = 16  # 128-bit (Secure)
-    HIGH   = 32  # 256-bit (Ultra-Secure)
-    
+    """Supported XOR key lengths for R4S obfuscation (not cryptographic)."""
+    LOW    = 8   # 64-bit
+    MID    = 16  # 128-bit
+    HIGH   = 32  # 256-bit
+
     @classmethod
     def is_valid(cls, length: int) -> bool:
         return length in cls._value2member_map_
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("r4s")
-__version__ = "1.0.0-core"
+__version__ = "1.1.0-core"
+
+class R4SCorruptError(ValueError):
+    """Raised when an archive's manifest/footer cannot be read or recovered."""
+    pass
 
 class R4SBinaryManager:
     def __init__(self, path: Union[str, Path]):
         self.path = Path(path)
-        
+
     @contextlib.contextmanager
     def lock(self):
         mode = "r+b" if self.path.exists() else "w+b"
@@ -75,8 +84,13 @@ class R4SLayout:
     FOOTER_SIZE = 64
     MANIFEST_HEAD_SIZE = 52
     MAGIC_H_PATTERN = "R4S_{:02d}__" # 8 bytes
-    MAGIC_M = b"R4SM"
+    MAGIC_M = b"R4SM"   # v1 manifest (no per-record CRC/mtime)
+    MAGIC_M2 = b"R4S2"  # v2 manifest (adds crc32 + mtime per record)
     MAGIC_F = b"__R4S__"
+    # The record format is determined by the manifest's own magic, not the
+    # header version, so a crash between header and manifest updates can
+    # never cause records to be parsed with the wrong layout.
+    FORMAT_VERSION = 0x02
 
     @classmethod
     def load(cls, path: Union[str, Path], password: Optional[str] = None) -> 'R4SLayout':
@@ -85,10 +99,10 @@ class R4SLayout:
             raise FileNotFoundError(f"Archive not found at {path}")
         if path.stat().st_size < cls.HEADER_SIZE:
             raise ValueError(f"File at {path} is too small to be an R4S archive")
-            
+
         with open(path, "rb") as f:
             buf = f.read(cls.HEADER_SIZE)
-        
+
         # Load logic
         inst = cls(password=password)
         res = inst.parse_header(buf, password)
@@ -104,7 +118,7 @@ class R4SLayout:
         self.r4s_key: Optional[bytes] = None # None means not yet established
         self.uid = uid
         self.created_at = created_at
-        self.version = 0x01
+        self.version = self.FORMAT_VERSION
         self.password = password
 
     @property
@@ -112,16 +126,24 @@ class R4SLayout:
         """Alias for key_len to maintain compatibility with test cases."""
         return self.key_len
 
-    def fast_xor(self, data: bytes, full: bool = True) -> bytes:
+    def fast_xor(self, data: bytes, full: bool = True, key_offset: int = 0) -> bytes:
+        """XOR ``data`` with the repeating key.
+
+        ``key_offset`` is the absolute plaintext position of ``data[0]``,
+        so streams can be XORed chunk-by-chunk without requiring chunk
+        lengths to be multiples of the key length.
+        """
         if not data: return b""
         if self.r4s_key is None: return data # Safety: can't XOR without key
+        phase = key_offset % self.key_len
+        key = self.r4s_key[phase:] + self.r4s_key[:phase]
         n = len(data)
         limit = n if full else min(n, self.scramble_size)
-        CHUNK_SIZE = 1024 * 1024 
+        CHUNK_SIZE = 1024 * 1024
         res_chunks = []
-        precalc_key = (self.r4s_key * (CHUNK_SIZE // self.key_len + 1))[:CHUNK_SIZE]
+        precalc_key = (key * (CHUNK_SIZE // self.key_len + 1))[:CHUNK_SIZE]
         i_key_full = int.from_bytes(precalc_key, "big")
-        
+
         target = data[:limit]
         for offset in range(0, limit, CHUNK_SIZE):
             chunk = target[offset:offset+CHUNK_SIZE]
@@ -134,28 +156,28 @@ class R4SLayout:
 
     def parse_header(self, buf: bytes, password: Optional[str]) -> bool:
         if len(buf) < self.HEADER_SIZE: return False
-        
+
         # 1. First CRC check (0-59)
         crc1_claimed = struct.unpack("<I", buf[60:64])[0]
         crc1_actual = binascii.crc32(buf[0:60]) & 0xFFFFFFFF
         if crc1_actual != crc1_claimed:
             return None # Use None to indicate CRC error specifically
-            
+
         # 2. Final CRC check (0-251)
         crc2_claimed = struct.unpack("<I", buf[252:256])[0]
         crc2_actual = binascii.crc32(buf[0:252]) & 0xFFFFFFFF
         if crc2_actual != crc2_claimed:
             return False
-            
+
         # 3. Parse Fixed Part (0-31)
         magic_raw, ver, flags, key_len, scr_size, created_at, uid = struct.unpack("<8sBBHIQ8s", buf[0:32])
         if magic_raw[0:4] != b"R4S_":
             return False
-        
+
         magic = magic_raw.decode("ascii", errors="replace")
         if not magic.startswith("R4S_"):
             return False
-            
+
         # マジックナンバー (R4S_xx__) から仕様を確定
         m_key_len = 0
         if magic == "R4S_08__":
@@ -164,30 +186,30 @@ class R4SLayout:
             m_key_len = 16
         elif magic == "R4S_32__":
             m_key_len = 32
-            
+
         if m_key_len == 0:
             return False
-            
+
         if m_key_len != key_len:
             return False
-        
+
         # 3.5 Metadata sync (ver, scr_size, created_at, uid)
         self.version = ver
         self.scramble_size = scr_size
         self.key_len = int(key_len)
         self.uid = uid
         self.created_at = created_at
-        
+
         # 4. Decrypt Key
         # 64-*** Var Part
         mask_off = 64
         sk_off = mask_off + key_len
         pc_off = sk_off + key_len
-        
+
         mask = buf[mask_off : sk_off]
         scrambled = buf[sk_off : pc_off]
         pass_check = buf[pc_off : pc_off + 8]
-        
+
         has_pass = bool(flags & 0x01)
         u_hash = b"\x00" * int(key_len)
         if has_pass:
@@ -198,7 +220,7 @@ class R4SLayout:
             check_hash = hashlib.sha256(u_hash + mask[:int(key_len)]).digest()[:8]
             if check_hash != pass_check:
                 return False
-            
+
         self.r4s_key = bytes(a ^ b ^ c for a, b, c in zip(scrambled[:int(key_len)], mask[:int(key_len)], u_hash[:int(key_len)]))
         return True
 
@@ -210,46 +232,52 @@ class R4SLayout:
         # 鍵がまだ確立されていない（新規作成時など）場合のみランダム生成
         if self.r4s_key is None or len(self.r4s_key) != self.key_len:
             self.r4s_key = secrets.token_bytes(self.key_len)
-            
+
         magic = self.MAGIC_H_PATTERN.format(self.key_len).encode("ascii")
         flags = 0x01 if password else 0x00
-        
-        fixed_part = struct.pack("<8sBBHIQ8s28x", magic, self.version, flags, self.key_len, 
+
+        fixed_part = struct.pack("<8sBBHIQ8s28x", magic, self.version, flags, self.key_len,
                                self.scramble_size, self.created_at, self.uid)
         crc1 = binascii.crc32(fixed_part) & 0xFFFFFFFF
         head_64 = fixed_part + struct.pack("<I", crc1)
-        
+
         mask = secrets.token_bytes(self.key_len)
         u_hash = b"\x00" * self.key_len
         pass_check = b"\x00" * 8
         if password:
             u_hash = hashlib.shake_256(password.encode() + mask).digest(int(self.key_len))
             pass_check = hashlib.sha256(u_hash + mask).digest()[:8]
-            
+
         scrambled_key = bytes(a ^ b ^ c for a, b, c in zip(self.r4s_key[:int(self.key_len)], mask[:int(self.key_len)], u_hash[:int(self.key_len)]))
-        
+
         var_part = mask + scrambled_key + pass_check
         full_buf = (head_64 + var_part).ljust(252, b"\x00")
-        
+
         crc2 = binascii.crc32(full_buf) & 0xFFFFFFFF
         return full_buf + struct.pack("<I", crc2)
 
     def parse_footer(self, data: bytes) -> Optional[Dict]:
         if len(data) < self.FOOTER_SIZE or data[-7:] != self.MAGIC_F: return None
+        # v2 footers carry a CRC32 at [53:57]; v1 footers have zeros there.
+        crc_claimed = struct.unpack("<I", data[53:57])[0]
+        if crc_claimed != 0 and binascii.crc32(data[:53]) & 0xFFFFFFFF != crc_claimed:
+            return None
         unpacked = struct.unpack("<qQQI", data[:28])
         uid_bytes = struct.pack("<Q", unpacked[1]) # Convert back to 8 bytes
         return {"manifest_offset": unpacked[0], "uuid": uid_bytes, "revision": unpacked[2], "flags": unpacked[3]}
 
     def pack_footer(self, manifest_off: int, revision: int, flags: int = 0) -> bytes:
         uid_int = int.from_bytes(self.uid, "little")
-        body = struct.pack("<qQQI", manifest_off, uid_int, revision, flags)
-        return body.ljust(self.FOOTER_SIZE - 7, b"\x00") + self.MAGIC_F
+        body = struct.pack("<qQQI", manifest_off, uid_int, revision, flags).ljust(53, b"\x00")
+        crc = binascii.crc32(body) & 0xFFFFFFFF
+        return body + struct.pack("<I", crc) + self.MAGIC_F
 
-    def pack_manifest(self, entries: Dict[int, 'R4SEntry'], assets: Dict[int, 'R4SEntry'], 
+    def pack_manifest(self, entries: Dict[int, 'R4SEntry'], assets: Dict[int, 'R4SEntry'],
                       anno: dict, meta: dict, f_handle) -> bytes:
         res_map = {}
-        buf = b"".join([struct.pack("<H", len(e.name.encode("utf-8"))) + e.name.encode("utf-8") + 
-                        struct.pack("<QQqb", e.uid, e.offset, e.size, 1 if e.is_deleted else 0) 
+        buf = b"".join([struct.pack("<H", len(e.name.encode("utf-8"))) + e.name.encode("utf-8") +
+                        struct.pack("<QQqIQb", e.uid, e.offset, e.size, e.crc, e.mtime,
+                                    1 if e.is_deleted else 0)
                         for e in entries.values()])
         res_map["idx"] = (f_handle.tell(), len(buf))
         f_handle.write(self.fast_xor(buf, True))
@@ -258,8 +286,9 @@ class R4SLayout:
         for a in assets.values():
             name_b, mime_b = a.name.encode("utf-8"), (a.mime or "").encode("utf-8")
             flg = 1 if a.is_deleted else 0
-            chunks.append(struct.pack("<H", len(name_b)) + name_b + 
-                          struct.pack("<QQqHb", a.uid, a.offset, a.size, len(mime_b), flg) + mime_b)
+            chunks.append(struct.pack("<H", len(name_b)) + name_b +
+                          struct.pack("<QQqIQHb", a.uid, a.offset, a.size, a.crc, a.mtime,
+                                      len(mime_b), flg) + mime_b)
         buf = b"".join(chunks)
         res_map["asset"] = (f_handle.tell(), len(buf))
         f_handle.write(self.fast_xor(buf, True))
@@ -269,24 +298,34 @@ class R4SLayout:
             res_map[k] = (f_handle.tell(), len(buf))
             f_handle.write(self.fast_xor(buf, True))
 
-        return struct.pack("<4s qI qI qI qI", self.MAGIC_M,
+        return struct.pack("<4s qI qI qI qI", self.MAGIC_M2,
                            res_map["idx"][0], res_map["idx"][1],
                            res_map["asset"][0], res_map["asset"][1],
                            res_map["anno"][0], res_map["anno"][1],
                            res_map["meta"][0], res_map["meta"][1])
 
     def parse_manifest_head(self, buf: bytes) -> Dict:
-        if len(buf) < self.MANIFEST_HEAD_SIZE or buf[:4] != self.MAGIC_M: return {}
+        if len(buf) < self.MANIFEST_HEAD_SIZE: return {}
+        if buf[:4] == self.MAGIC_M2:
+            m_ver = 2
+        elif buf[:4] == self.MAGIC_M:
+            m_ver = 1
+        else:
+            return {}
         vals = struct.unpack("<4s qI qI qI qI", buf[:self.MANIFEST_HEAD_SIZE])
-        return {k: {"off": vals[i*2+1], "sz": vals[i*2+2]} for i, k in enumerate(["idx", "asset", "anno", "meta"])}
+        res = {k: {"off": vals[i*2+1], "sz": vals[i*2+2]} for i, k in enumerate(["idx", "asset", "anno", "meta"])}
+        res["ver"] = m_ver
+        return res
 
 class R4SEntry:
     def __init__(self, uid: int, name: str, offset: int = 0, size: int = 0):
         self.uid = uid; self.name = name; self.offset = offset; self.size = size
         self.mime: Optional[str] = None
+        self.crc = 0        # CRC32 of plaintext; 0 = not computed (v1 / pending)
+        self.mtime = 0      # Unix epoch seconds; 0 = unknown (v1)
         self._is_modified = False
         self.is_deleted = False
-        
+
         # --- Pending Sources ---
         self.pending_source_path: Optional[str] = None
         self.pending_source_bytes: Optional[bytes] = None
@@ -294,7 +333,7 @@ class R4SEntry:
         self.pending_source_archive: Optional['R4SArchive'] = None
         self.pending_source_uid: Optional[int] = None
         self.pending_is_asset: bool = False
-        
+
     @property
     def is_new(self) -> bool:
         """新規作成（オフセット未確定）かつ削除されていないエントリ"""
@@ -308,16 +347,17 @@ class R4SEntry:
 class R4SArchive:
     WRITE_BUFFER_SIZE = 10 * 1024 * 1024
     MAX_MEMORY_BYTES = 5 * 1024 * 1024
+    FOOTER_SCAN_LIMIT = 8 * 1024 * 1024  # how far back to search for a recoverable footer
 
     @classmethod
-    def create(cls, path: Union[str, Path], password: Optional[str] = None, 
+    def create(cls, path: Union[str, Path], password: Optional[str] = None,
                key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096,
                keep_open: bool = False) -> 'R4SArchive':
         """新規にアーカイブを作成し、インスタンスを返す（既存ファイルがあれば FileExistsError）"""
         path = Path(path)
         if path.exists():
             raise FileExistsError(f"Archive already exists at {path}")
-        
+
         inst = cls(path, password, key_len, scramble_size, keep_open=keep_open)
         inst._is_ready = True
         inst.save()
@@ -326,25 +366,29 @@ class R4SArchive:
     @classmethod
     def open(cls, path: Union[str, Path], password: Optional[str] = None,
              keep_open: bool = False) -> 'R4SArchive':
-        """既存のアーカイブを開き、ロードして返す（ファイルがない場合は FileNotFoundError）"""
+        """既存のアーカイブを開き、ロードして返す。
+
+        ファイルがない場合は FileNotFoundError、ヘッダー不正は ValueError、
+        マニフェスト/フッターが復旧不能な場合は R4SCorruptError を送出します。
+        """
         inst = cls(path, password, keep_open=keep_open)
         if not inst.path.exists():
             raise FileNotFoundError(f"Archive not found at {inst.path}")
         if inst.path.stat().st_size < R4SLayout.HEADER_SIZE:
             raise ValueError(f"File at {inst.path} is too small to be an R4S archive")
-            
+
         # 明示的にロード
         inst._load(password)
         inst._is_ready = True
         return inst
 
-    def __init__(self, path: Union[str, Path], password: Optional[str] = None, 
+    def __init__(self, path: Union[str, Path], password: Optional[str] = None,
                key_len: int = R4SKeyLen.LOW, scramble_size: int = 4096,
                keep_open: bool = False):
         # 鍵長のバリデーション (fail-fast)
         if not R4SKeyLen.is_valid(key_len):
             raise ValueError(f"Unsupported key length: {key_len}. Use R4SKeyLen.")
-            
+
         self.path = Path(path)
         self._password = password
         self._is_ready = False
@@ -369,19 +413,19 @@ class R4SArchive:
         self._archive_meta = {"next_uid": 1}
         self._revision = 1
         self._payload_end_offset = self._layout.HEADER_SIZE
-        
+
         self._staging_file_path = self.path.parent / f"{self.path.name}.{secrets.token_hex(4)}.tmp"
 
     @property
-    def _uuid(self): 
+    def _uuid(self):
         return self._layout.uid
-        
+
     @property
-    def _created_at(self): 
+    def _created_at(self):
         return self._layout.created_at
-        
+
     @property
-    def _revision_num(self): 
+    def _revision_num(self):
         """Property for internal revision management."""
         return self._revision
 
@@ -394,7 +438,7 @@ class R4SArchive:
             except Exception:
                 pass
             self._f_handle = None
-            
+
         if self._staging_file_path.exists():
             try:
                 os.remove(self._staging_file_path)
@@ -428,10 +472,59 @@ class R4SArchive:
         """物理ファイルへの読み込みハンドルを取得します（keep_open に対応）"""
         if not self._keep_open:
             return open(self.path, "rb")
-            
+
         if self._f_handle is None or self._f_handle.closed:
             self._f_handle = open(self.path, "rb")
         return self._f_handle
+
+    def _close_read_handle(self):
+        if self._f_handle:
+            try:
+                self._f_handle.close()
+            except Exception:
+                pass
+            self._f_handle = None
+
+    def _locate_manifest(self, f, f_size: int) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """フッターとマニフェストヘッドを特定する。
+
+        末尾のフッターが不正な場合（書き込み中のクラッシュ等）、
+        後方スキャンで直近の有効なフッターを探して復旧する。
+        """
+        def try_footer(raw: bytes):
+            footer = self._layout.parse_footer(raw)
+            if not footer:
+                return None, None
+            m_off = footer["manifest_offset"]
+            if not (self._layout.HEADER_SIZE <= m_off <= f_size - self._layout.MANIFEST_HEAD_SIZE):
+                return None, None
+            f.seek(m_off)
+            m_head_raw = self._layout.fast_xor(f.read(self._layout.MANIFEST_HEAD_SIZE), True)
+            m_head = self._layout.parse_manifest_head(m_head_raw)
+            if not m_head:
+                return None, None
+            return footer, m_head
+
+        if f_size >= self._layout.HEADER_SIZE + self._layout.FOOTER_SIZE:
+            f.seek(f_size - self._layout.FOOTER_SIZE)
+            footer, m_head = try_footer(f.read(self._layout.FOOTER_SIZE))
+            if footer:
+                return footer, m_head
+
+        # Recovery: scan the tail backwards for the most recent valid footer.
+        tail_len = min(f_size, self.FOOTER_SCAN_LIMIT)
+        f.seek(f_size - tail_len)
+        tail = f.read(tail_len)
+        pos = tail.rfind(self._layout.MAGIC_F)
+        while pos != -1:
+            end = pos + len(self._layout.MAGIC_F)
+            if end >= self._layout.FOOTER_SIZE:
+                footer, m_head = try_footer(tail[end - self._layout.FOOTER_SIZE:end])
+                if footer:
+                    logger.warning(f"Archive tail was damaged; recovered revision {footer['revision']} at {self.path}")
+                    return footer, m_head
+            pos = tail.rfind(self._layout.MAGIC_F, 0, pos)
+        return None, None
 
     def _load(self, password):
         self._entries.clear()
@@ -439,30 +532,22 @@ class R4SArchive:
         self._path_index.clear()
         self._asset_key_index.clear()
         self._entry_meta.clear()
-        try:
-            f_size = self.path.stat().st_size
-            with open(self.path, "rb") as f:
-                # 常に最新のレイアウトをロードして差し替える（状態干渉を防止）
-                self._layout = R4SLayout.load(self.path, password)
-                
-                f.seek(f_size - self._layout.FOOTER_SIZE)
-                footer_raw = f.read(self._layout.FOOTER_SIZE)
-                footer = self._layout.parse_footer(footer_raw)
-                if not footer:
-                    return
-                
-                m_off = footer["manifest_offset"]
-                f.seek(m_off)
-                m_head_raw = self._layout.fast_xor(f.read(self._layout.MANIFEST_HEAD_SIZE), True)
-                m_head = self._layout.parse_manifest_head(m_head_raw)
-                if not m_head:
-                    return
 
-                min_off = m_head.get("idx", {}).get("off", m_off)
+        f_size = self.path.stat().st_size
+        # 常に最新のレイアウトをロードして差し替える（状態干渉を防止）
+        self._layout = R4SLayout.load(self.path, password)
+
+        with open(self.path, "rb") as f:
+            footer, m_head = self._locate_manifest(f, f_size)
+            if not footer:
+                raise R4SCorruptError(f"No valid manifest found in {self.path} (footer missing or corrupt)")
+            v2 = m_head.get("ver", 1) >= 2
+
+            try:
+                min_off = m_head.get("idx", {}).get("off", footer["manifest_offset"])
                 self._revision = footer["revision"]
                 self._payload_end_offset = min_off
 
-                # --- Restore Manifest Parsing ---
                 if m_head.get("idx", {}).get("sz", 0) > 0:
                     f.seek(m_head["idx"]["off"])
                     buf = self._layout.fast_xor(f.read(m_head["idx"]["sz"]), True)
@@ -470,10 +555,15 @@ class R4SArchive:
                     while ptr < len(buf):
                         ln = struct.unpack("<H", buf[ptr:ptr+2])[0]; ptr += 2
                         name = buf[ptr:ptr+ln].decode("utf-8"); ptr += ln
-                        uid, off, sz, flg = struct.unpack("<QQqb", buf[ptr:ptr+25]); ptr += 25
+                        if v2:
+                            uid, off, sz, crc, mt, flg = struct.unpack("<QQqIQb", buf[ptr:ptr+37]); ptr += 37
+                        else:
+                            uid, off, sz, flg = struct.unpack("<QQqb", buf[ptr:ptr+25]); ptr += 25
+                            crc, mt = 0, 0
                         e = R4SEntry(uid, name, off, sz); e.is_deleted = bool(flg)
+                        e.crc = crc; e.mtime = mt
                         self._entries[uid] = e; self._path_index.setdefault(name, []).append(uid)
-                
+
                 if m_head.get("asset", {}).get("sz", 0) > 0:
                     f.seek(m_head["asset"]["off"])
                     buf = self._layout.fast_xor(f.read(m_head["asset"]["sz"]), True)
@@ -481,24 +571,30 @@ class R4SArchive:
                     while ptr < len(buf):
                         ln = struct.unpack("<H", buf[ptr:ptr+2])[0]; ptr += 2
                         name = buf[ptr:ptr+ln].decode("utf-8"); ptr += ln
-                        uid, off, sz, mln, flg = struct.unpack("<QQqHb", buf[ptr:ptr+27]); ptr += 27
+                        if v2:
+                            uid, off, sz, crc, mt, mln, flg = struct.unpack("<QQqIQHb", buf[ptr:ptr+39]); ptr += 39
+                        else:
+                            uid, off, sz, mln, flg = struct.unpack("<QQqHb", buf[ptr:ptr+27]); ptr += 27
+                            crc, mt = 0, 0
                         mime = buf[ptr:ptr+mln].decode("utf-8"); ptr += mln
                         a = R4SEntry(uid, name, off, sz); a.mime = mime; a.is_deleted = bool(flg)
+                        a.crc = crc; a.mtime = mt
                         self._assets[uid] = a; self._asset_key_index.setdefault(name, []).append(uid)
-                
+
                 if m_head.get("anno", {}).get("sz", 0) > 0:
                     f.seek(m_head["anno"]["off"])
                     self._entry_meta = json.loads(self._layout.fast_xor(f.read(m_head["anno"]["sz"]), True).decode("utf-8"))
-                    
+
                 if m_head.get("meta", {}).get("sz", 0) > 0:
                     f.seek(m_head["meta"]["off"])
                     self._archive_meta = json.loads(self._layout.fast_xor(f.read(m_head["meta"]["sz"]), True).decode("utf-8"))
-        except Exception as e:
-            logger.error(f"Load failed: {e}")
+            except (struct.error, UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise R4SCorruptError(f"Manifest data is corrupt in {self.path}: {e}") from e
 
     def _handle_source_input(self, entry: R4SEntry, source: Union[bytes, str, Path]):
         """入力を bytes, file path, または staging file に振り分ける"""
         if isinstance(source, bytes):
+            entry.mtime = int(time.time())
             if len(source) <= self.MAX_MEMORY_BYTES:
                 entry.pending_source_bytes = source
                 entry.size = len(source)
@@ -511,20 +607,35 @@ class R4SArchive:
         else:
             p = Path(source)
             entry.pending_source_path = str(p)
-            if p.exists(): entry.size = p.stat().st_size
+            if p.exists():
+                st = p.stat()
+                entry.size = st.st_size
+                entry.mtime = int(st.st_mtime)
         self._is_dirty = True
 
     # --- Core State Management ---
     def save(self):
+        """変更をディスクへ反映します（追記型・クラッシュセーフ）。
+
+        既存領域には一切触れず、ファイル末尾に「新データ + 新マニフェスト +
+        新フッター」を追記します。書き込み途中で異常終了しても、旧フッターは
+        無傷のまま残るため、次回ロード時に後方スキャンで直近の正常な状態へ
+        復旧できます。旧マニフェスト等の死領域は optimize() で回収されます。
+        """
         if not self._is_dirty: return
-            
+
         # 書き込み前に読み取りハンドルがあれば閉じる（Windowsでの衝突回避）
-        if self._f_handle:
-            try:
-                self._f_handle.close()
-            except Exception:
-                pass
-            self._f_handle = None
+        self._close_read_handle()
+
+        pending = [i for i in list(self._entries.values()) + list(self._assets.values())
+                   if i.pending_source_path or i.pending_staging_info
+                   or i.pending_source_archive or i.pending_source_bytes is not None]
+
+        # 事前検証: ソースが欠けている場合はファイルに触れる前に中止する
+        missing = [i.pending_source_path for i in pending
+                   if i.pending_source_path and not os.path.exists(i.pending_source_path)]
+        if missing:
+            raise FileNotFoundError(f"Cannot save: source file(s) no longer exist: {missing}")
 
         bm = R4SBinaryManager(self.path)
         write_buffer = bytearray()
@@ -532,7 +643,11 @@ class R4SArchive:
             if write_buffer: f_h.write(write_buffer); write_buffer.clear()
 
         with bm.lock() as f:
-            # 3. ヘッダーの更新 (常に現在のパスワードで再パックして上書き)
+            f.seek(0, 2)
+            orig_size = f.tell()
+
+            # ヘッダーは常に現在のパスワード・最新バージョンで再パックして上書き
+            self._layout.version = R4SLayout.FORMAT_VERSION
             f.seek(0)
             f.write(self._layout.pack_header(self._password))
             f.flush()
@@ -540,83 +655,81 @@ class R4SArchive:
                 os.fsync(f.fileno())
             except Exception:
                 pass
-            
-            # 1. 保存直前のバックアップ
-            f.seek(self._payload_end_offset)
-            rollback_data = f.read()
-            original_payload_pos = self._payload_end_offset
-            
-            # 2. フタを切り飛ばす
-            f.truncate(self._payload_end_offset)
-            f.seek(self._payload_end_offset)
-            
+
+            # ロールバック用スナップショット（追記分を切り捨て、メモリ状態を復元）
+            snapshot = [(i, i.offset, i.size, i.crc, i.mtime,
+                         i.pending_source_path, i.pending_source_bytes,
+                         i.pending_staging_info, i.pending_source_archive,
+                         i.pending_source_uid) for i in pending]
+            old_payload_end = self._payload_end_offset
+            old_revision = self._revision
+
+            append_start = max(orig_size, self._layout.HEADER_SIZE)
+            f.seek(append_start)
+
+            def write_stream(stream) -> Tuple[int, int]:
+                """平文ストリームを難読化しつつ書き込み、(サイズ, CRC32) を返す"""
+                pos = 0
+                crc = 0
+                limit = self._layout.scramble_size
+                for chunk in stream:
+                    crc = binascii.crc32(chunk, crc)
+                    if pos < limit:
+                        n = min(len(chunk), limit - pos)
+                        out = self._layout.fast_xor(chunk[:n], full=True, key_offset=pos) + chunk[n:]
+                    else:
+                        out = chunk
+                    pos += len(chunk)
+                    write_buffer.extend(out)
+                    if len(write_buffer) >= self.WRITE_BUFFER_SIZE: flush_buf(f)
+                return pos, crc & 0xFFFFFFFF
+
+            def file_stream(path):
+                with open(path, "rb") as src:
+                    while True:
+                        c = src.read(1024 * 1024)
+                        if not c: break
+                        yield c
+
+            def staging_stream(path, start, length):
+                with open(path, "rb") as src:
+                    src.seek(start)
+                    rem = length
+                    while rem > 0:
+                        c = src.read(min(1024 * 1024, rem))
+                        if not c: break
+                        yield c
+                        rem -= len(c)
+
             try:
-                pending = [i for i in list(self._entries.values()) + list(self._assets.values()) 
-                           if i.pending_source_path or i.pending_staging_info or getattr(i, 'pending_source_archive', None) or i.pending_source_bytes is not None]
-                
-                def encrypt_stream(stream):
-                    scrambled = 0
-                    scramble_limit = self._layout.scramble_size
-                    for chunk in stream:
-                        if scrambled < scramble_limit:
-                            to_scramble = min(len(chunk), scramble_limit - scrambled)
-                            yield self._layout.fast_xor(chunk[:to_scramble], full=True)
-                            if len(chunk) > to_scramble:
-                                yield chunk[to_scramble:]
-                            scrambled += to_scramble
-                        else:
-                            yield chunk
-
-                def file_stream(path):
-                    with open(path, "rb") as src:
-                        while True:
-                            c = src.read(1024 * 1024)
-                            if not c: break
-                            yield c
-
-                def staging_stream(path, start, length):
-                    with open(path, "rb") as src:
-                        src.seek(start)
-                        rem = length
-                        while rem > 0:
-                            c = src.read(min(1024 * 1024, rem))
-                            if not c: break
-                            yield c
-                            rem -= len(c)
-
-                # 3. データの直列書き込み
                 for item in pending:
                     item.offset = f.tell() + len(write_buffer)
-                    
-                    if getattr(item, 'pending_source_archive', None):
-                        src_stream = item.pending_source_archive.iter_entry(item.pending_source_uid, is_asset=item.pending_is_asset)
-                        for chunk in encrypt_stream(src_stream):
-                            write_buffer.extend(chunk)
-                            if len(write_buffer) >= self.WRITE_BUFFER_SIZE: flush_buf(f)
+
+                    if item.pending_source_archive is not None:
+                        src_arc = item.pending_source_archive
+                        src_stream = src_arc.iter_entry(item.pending_source_uid, is_asset=item.pending_is_asset)
+                        item.size, item.crc = write_stream(src_stream)
                         item.pending_source_archive = None
 
-                    elif item.pending_source_path and os.path.exists(item.pending_source_path):
-                        for chunk in encrypt_stream(file_stream(item.pending_source_path)):
-                            write_buffer.extend(chunk)
-                            if len(write_buffer) >= self.WRITE_BUFFER_SIZE: flush_buf(f)
+                    elif item.pending_source_path:
+                        item.size, item.crc = write_stream(file_stream(item.pending_source_path))
                         item.pending_source_path = None
-                        
+
                     elif item.pending_staging_info:
                         stg_off, stg_sz = item.pending_staging_info
-                        for chunk in encrypt_stream(staging_stream(self._staging_file_path, stg_off, stg_sz)):
-                            write_buffer.extend(chunk)
-                            if len(write_buffer) >= self.WRITE_BUFFER_SIZE: flush_buf(f)
+                        item.size, item.crc = write_stream(staging_stream(self._staging_file_path, stg_off, stg_sz))
                         item.pending_staging_info = None
-                    
+
                     elif item.pending_source_bytes is not None:
-                        for chunk in encrypt_stream([item.pending_source_bytes]):
-                            write_buffer.extend(chunk)
-                            if len(write_buffer) >= self.WRITE_BUFFER_SIZE: flush_buf(f)
+                        item.size, item.crc = write_stream([item.pending_source_bytes])
                         item.pending_source_bytes = None
-                        
+
+                    if item.mtime == 0:
+                        item.mtime = int(time.time())
+
                 flush_buf(f)
-                
-                # 4. マニフェストの再生成
+
+                # マニフェストとフッターを追記
                 self._payload_end_offset = f.tell()
                 m_head_bytes = self._layout.pack_manifest(self._entries, self._assets, self._entry_meta, self._archive_meta, f)
                 m_head_off = f.tell()
@@ -626,69 +739,87 @@ class R4SArchive:
                 f.write(footer_bytes)
                 f.truncate()
                 f.flush(); os.fsync(f.fileno())
-                
+
                 for i in list(self._entries.values()) + list(self._assets.values()):
                     i._is_modified = False
-                    
-                # 5. Stagingファイルのクリーンアップ
+
+                # Stagingファイルのクリーンアップ
                 if self._staging_file_path.exists():
                     try: os.remove(self._staging_file_path)
                     except OSError: pass
-                    
+
             except Exception as e:
-                # 失敗時のロールバック処理
-                f.seek(original_payload_pos)
-                f.truncate()
-                f.write(rollback_data)
-                f.flush(); os.fsync(f.fileno())
+                # ロールバック: 追記分を切り捨て、メモリ状態をスナップショットから復元
+                try:
+                    f.truncate(orig_size)
+                    f.flush(); os.fsync(f.fileno())
+                except Exception:
+                    pass
+                for (i, off, sz, crc, mt, sp, sb, si, sa, su) in snapshot:
+                    i.offset, i.size, i.crc, i.mtime = off, sz, crc, mt
+                    i.pending_source_path = sp
+                    i.pending_source_bytes = sb
+                    i.pending_staging_info = si
+                    i.pending_source_archive = sa
+                    i.pending_source_uid = su
+                self._payload_end_offset = old_payload_end
+                self._revision = old_revision
                 logger.error(f"Save failed, rolled back: {e}"); raise
-                
+
         self._is_dirty = False
         # 書き込み終了後、必要ならハンドルを再開
         if self._keep_open:
             self._get_read_handle()
 
     def optimize(self, new_key_len: Optional[int] = None, new_scramble_size: Optional[int] = None):
+        """死領域（削除エントリ・旧マニフェスト）を回収して再構築します。"""
         tmp_path = self.path.with_suffix(".opt_tmp")
+        if tmp_path.exists():
+            os.remove(tmp_path)  # 過去の失敗が残っていたら除去
         # 移行用パラメータの決定
         target_key_len = new_key_len if new_key_len is not None else self._layout.r4s_key_len
         target_scr_size = new_scramble_size if new_scramble_size is not None else self._layout.scramble_size
-        
+
         # 新しい設定で空のアーカイブ・インスタンスを準備（自動保存なし）
-        new_archive = type(self)(tmp_path, self._password, 
-                                 key_len=target_key_len, 
+        new_archive = type(self)(tmp_path, self._password,
+                                 key_len=target_key_len,
                                  scramble_size=target_scr_size)
-                                        
+
         new_archive._layout.uid = self._layout.uid
         new_archive._layout.created_at = int(time.time()) # Optimization/Migrate updates timestamp
         new_archive._archive_meta = self._archive_meta.copy()
         new_archive._entry_meta = self._entry_meta.copy()
-        
+
         for uid, e in self._entries.items():
             if not e.is_deleted:
                 new_e = R4SEntry(uid, e.name, size=e.size)
+                new_e.mtime = e.mtime
                 new_e.pending_source_archive = self
                 new_e.pending_source_uid = uid
                 new_e.pending_is_asset = False
                 new_archive._entries[uid] = new_e
                 new_archive._path_index.setdefault(e.name, []).append(uid)
-                
+
         for uid, a in self._assets.items():
             if not a.is_deleted:
                 new_a = R4SEntry(uid, a.name, size=a.size)
                 new_a.mime = a.mime
+                new_a.mtime = a.mtime
                 new_a.pending_source_archive = self
                 new_a.pending_source_uid = uid
                 new_a.pending_is_asset = True
                 new_archive._assets[uid] = new_a
                 new_archive._asset_key_index.setdefault(a.name, []).append(uid)
-        
+
         new_archive._is_dirty = True
         new_archive.save()
         new_archive.close() # 明示的にクローズしてロックを解除
-        # 最適化したファイルを既存のものと入れ替え、再ロード
+        # Windows では開いているハンドルがあると os.replace が失敗するため先に閉じる
+        self._close_read_handle()
         os.replace(tmp_path, self.path)
         self._load(self._password)
+        if self._keep_open:
+            self._get_read_handle()
 
     # --- Entry API ---
     def set_entry(self, logical_path: str, source: Union[bytes, str, Path]) -> int:
@@ -770,7 +901,7 @@ class R4SArchive:
         uid = self._resolve_uid(identifier, is_asset=is_asset)
         if uid is None: return
         entry = (self._assets if is_asset else self._entries)[uid]
-        
+
         if entry.pending_source_bytes is not None:
             for i in range(0, len(entry.pending_source_bytes), chunk_size):
                 yield entry.pending_source_bytes[i : i + chunk_size]
@@ -802,7 +933,7 @@ class R4SArchive:
             return
 
         if not self.path.exists(): return
-        
+
         f = self._get_read_handle()
         try:
             f.seek(entry.offset)
@@ -821,6 +952,20 @@ class R4SArchive:
             if not self._keep_open:
                 f.close()
 
+    def verify_entry(self, identifier: Union[str, int], is_asset: bool = False) -> Optional[bool]:
+        """保存済みCRC32とデータを照合します。
+
+        :return: True=一致 / False=破損 / None=CRC未記録（v1形式・未保存など）
+        """
+        uid = self._resolve_uid(identifier, is_asset=is_asset)
+        if uid is None: return None
+        entry = (self._assets if is_asset else self._entries)[uid]
+        if entry.crc == 0: return None
+        crc = 0
+        for chunk in self.iter_entry(uid, is_asset=is_asset):
+            crc = binascii.crc32(chunk, crc)
+        return (crc & 0xFFFFFFFF) == entry.crc
+
     def list_entries(self, parent_path: Optional[str] = None, recursive: bool = True) -> List[Tuple[int, str]]:
         """
         アーカイブ内のエントリ一覧を返します。
@@ -830,7 +975,7 @@ class R4SArchive:
         items = [(e.uid, e.name) for e in self._entries.values() if not e.is_deleted]
         if parent_path is None:
             return items
-            
+
         target_parent = parent_path.replace("\\", "/").rstrip("/")
         if target_parent == ".": target_parent = ""
 
@@ -890,7 +1035,7 @@ class R4SArchive:
         items = [(a.uid, a.name) for a in self._assets.values() if not a.is_deleted]
         if parent_path is None:
             return items
-            
+
         target_parent = parent_path.replace("\\", "/").rstrip("/")
         if target_parent == ".": target_parent = ""
 
@@ -957,16 +1102,29 @@ class R4SArchive:
         return {}
 
     # --- Extraction API ---
+    @staticmethod
+    def _sanitize_relpath(name: str) -> Optional[Path]:
+        """アーカイブ内の論理パスを、出力ディレクトリ内に収まる相対パスへ変換する。
+
+        絶対パス・ドライブレター・親ディレクトリ参照 (..) を部品単位で除去する。
+        """
+        norm = name.replace("\\", "/")
+        parts = [p for p in norm.split("/")
+                 if p and p not in (".", "..") and ":" not in p]
+        if not parts:
+            return None
+        return Path(*parts)
+
     def _extract_single(self, identifier: Union[str, int], output_path: Union[str, Path], is_asset: bool) -> bool:
         """単一エントリの抽出コア処理"""
         uid = self._resolve_uid(identifier, is_asset=is_asset)
         if uid is None: return False
-        
+
         out_p = Path(output_path)
         out_p.parent.mkdir(parents=True, exist_ok=True) # 親ディレクトリを自動生成
-        
+
         with open(out_p, "wb") as f:
-            for chunk in self.iter_entry(uid, chunk_size=self.write_buffer_size, is_asset=is_asset):
+            for chunk in self.iter_entry(uid, chunk_size=self.WRITE_BUFFER_SIZE, is_asset=is_asset):
                 f.write(chunk)
         return True
 
@@ -974,20 +1132,28 @@ class R4SArchive:
         """複数エントリの抽出コア処理"""
         out_dir = Path(output_dir)
         extracted_paths = []
-        
+
         for ident in identifiers:
             uid = self._resolve_uid(ident, is_asset=is_asset)
             if uid is None: continue
-            
+
             # アーカイブ内の論理パス（name）を使ってディレクトリ構造を再現
             entry = self._assets[uid] if is_asset else self._entries[uid]
-            # セキュリティ対策: 絶対パス扱いや上位階層への移動(../)を防ぐ
-            safe_name = str(Path(entry.name.lstrip("/"))).replace("..", "_")
+            safe_name = self._sanitize_relpath(entry.name)
+            if safe_name is None:
+                logger.warning(f"Skipping entry with unsafe name: {entry.name!r}")
+                continue
             out_path = out_dir / safe_name
-            
+            # 最終防衛: 解決後のパスが出力ディレクトリ配下であることを確認
+            try:
+                out_path.resolve().relative_to(out_dir.resolve())
+            except ValueError:
+                logger.warning(f"Skipping entry escaping output dir: {entry.name!r}")
+                continue
+
             if self._extract_single(uid, out_path, is_asset):
                 extracted_paths.append(str(out_path))
-                
+
         return extracted_paths
 
     def extract_entry(self, identifier: Union[str, int], output_path: Union[str, Path]) -> bool:
@@ -1014,7 +1180,7 @@ class R4SArchive:
     def get_tree(self, parent_path: Optional[str] = None, include_deleted: bool = False) -> dict:
         root_label = "/"
         target_entries = self._entries.items()
-        
+
         prefix = ""
         if parent_path:
             prefix = parent_path.replace("\\", "/").strip("/")
@@ -1022,11 +1188,11 @@ class R4SArchive:
             # list_entries を使って対象UIDを抽出
             uids = [u for u, n in self.list_entries(prefix, recursive=True)]
             target_entries = [(u, self._entries[u]) for u in uids]
-        
+
         root = {"type": "directory", "name": root_label, "children": {}}
         for uid, entry in target_entries:
             if not include_deleted and entry.is_deleted: continue
-            
+
             fullname = entry.name.replace("\\", "/").strip("/")
             if prefix:
                 if fullname.startswith(prefix + "/"):
@@ -1038,7 +1204,7 @@ class R4SArchive:
                 parts = rel_name.split("/")
             else:
                 parts = fullname.split("/")
-                
+
             curr = root
             for i, p in enumerate(parts):
                 if i == len(parts) - 1:

@@ -1,3 +1,14 @@
+Metadata-Version: 2.4
+Name: r4s-archive
+Version: 1.1.0
+Summary: A lightweight, crash-safe single-file archive system with a low-cost obfuscation layer.
+Author: t-ichi324
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+
 [日本語版 (Japanese)](./README_ja.md) | [English version (英語版)](./README.md) | [API Reference](./API.md)
 
 **R4S Archive System** is a lightweight single-file archive solution designed for speed and physical structural flexibility, with a low-cost obfuscation layer.

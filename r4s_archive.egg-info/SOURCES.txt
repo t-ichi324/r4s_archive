@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+r4s/archive.py
+r4s_archive.egg-info/PKG-INFO
+r4s_archive.egg-info/SOURCES.txt
+r4s_archive.egg-info/dependency_links.txt
+r4s_archive.egg-info/top_level.txt
+test/test_r4s_32byte.py
+test/test_r4s_dir_ops.py
+test/test_r4s_header_v2.py
+test/test_r4s_migration.py
+test/test_r4s_pass_debug.py
+test/test_r4s_phase1.py
+test/test_r4s_rename_repro.py
+test/test_r4s_security.py
